@@ -1,0 +1,28 @@
+### Terraform template
+# Local .terraform directories
+**/.terraform/*
+**/.terraform.lock.hcl
+
+# Local dev files
+.config
+.idea
+.kube
+.ssh
+
+# Terraform state
+**/terraform.tfstate.d/*
+*.tfstate
+*.tfstate.*
+
+# Terraform plan
+*.plan
+
+# Terraform local files
+terraform.tfvars
+hcp.tfvars
+**/.env
+
+# Jenkins local files
+jenkins/casc/jobs/seed-job/*
+!casc/jobs/seed-job/config.xml
+jenkins/casc/jobs/PKI*

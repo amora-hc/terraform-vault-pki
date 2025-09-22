@@ -1,0 +1,7 @@
+jquery3-api:3.7.1-3
+terraform:1.0.10
+hashicorp-vault-plugin:371.v884a_4dd60fb_6
+azure-cli:0.9
+configuration-as-code:1995.v540b_50a_eb_0c1
+job-dsl:1.93
+uno-choice:2.8.8

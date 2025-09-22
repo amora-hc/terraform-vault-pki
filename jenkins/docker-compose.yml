@@ -1,0 +1,28 @@
+services:
+  jenkins:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: jenkins-pki
+    platform: linux/amd64
+    restart: unless-stopped
+    ports:
+      - "8081:8080"
+      - "50000:50000"   # JNLP agents
+    volumes:
+      - jenkins-vol:/var/jenkins_home
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./casc/jenkins.yaml:/var/jenkins_home/casc/jenkins.yaml:ro
+      - ./casc/jobs:/var/jenkins_home/jobs
+
+    environment:
+      #JAVA_OPTS: "-Djenkins.install.runSetupWizard=false"
+      CASC_JENKINS_CONFIG: "/var/jenkins_home/casc/jenkins.yaml"
+ 
+networks:
+  default:
+    name: docker-vault-stack
+    external: true
+
+volumes:
+  jenkins-vol: {}

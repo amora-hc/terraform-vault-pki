@@ -1,0 +1,89 @@
+pipeline {
+    agent any
+    
+    environment {
+        WORK_DIR = '.'
+        //SERIAL = ''
+        SERIALS_FILE = '/var/jenkins_home/cert_serials/available_serials.txt'
+    }
+
+    parameters {
+        choice(name: 'PKI_MOUNT', choices: ['pki/subca-sand-azure/'], description: 'Select PKI mount (leaf CA)')
+        choice(name: 'ROLE', choices: ['subca-sand-azure-ssl-public', 'subca-sand-azure-sign-doc', 'subca-sand-oci-ssl-public'], description: 'Select role from chosen mount')
+        string(name: 'VAULT_ADDR', defaultValue: 'https://vault-cluster.hashicorp.cloud:8200', description: 'Vault address')
+        string(name: 'AZURE_KEYVAULT_NAME', defaultValue: 'VaultKeyVault20250811', description: 'AKV name')
+        string(name: 'AZURE_SUBSCRIPTION_ID', defaultValue: 'your-subscription-id', description: 'Azure cloud subscription ID')
+    }
+    
+    stages {
+        stage('Choose Serial for Revocation') {
+            steps {
+                script {
+                    def serials = fileExists(env.SERIALS_FILE)
+                        ? readFile(env.SERIALS_FILE).readLines().findAll { it.trim() }
+                        : ['No serials found']
+
+                    def selected = input(
+                        message: 'Select a certificate serial to revoke',
+                        parameters: [
+                            choice(name: 'SERIAL', choices: serials.join('\n'), description: 'Available serials')
+                        ]
+                    )
+                    env.SELECTED_SERIAL = selected
+                    echo "Selected serial: ${env.SELECTED_SERIAL}"
+                }
+            }
+        }  
+
+        stage('Revoke Certificate') {
+            steps {
+                script {
+                    def vaultAddr = params.VAULT_ADDR
+                    withCredentials([
+                        [
+                            $class: 'VaultTokenCredentialBinding',
+                            credentialsId: 'vault-cluster',
+                            vaultAddr: vaultAddr,
+                            vaultNamespace: 'admin/'
+                        ]
+                    ]) {
+                        sh """
+                            set -e
+                            SERIAL=${env.SELECTED_SERIAL}
+                            echo "Revoking certificate with serial number: \$SERIAL"
+                            vault write -format=json ${PKI_MOUNT}revoke serial_number=\$SERIAL
+                            sed -i "/^\$SERIAL\$/d" /var/jenkins_home/cert_serials/available_serials.txt
+                            sort -u -o /var/jenkins_home/cert_serials/available_serials.txt /var/jenkins_home/cert_serials/available_serials.txt
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('Delete certificate from Azure Key Vault') {
+            steps {
+                script {
+                    def azureSP = params.azureSP
+                    withCredentials([azureServicePrincipal('azure-cloud')]) {
+                        sh '''
+                            CN="${CERT_PREFIX}.${DNS_SUFFIX}"
+                            PFX_FILE="${CN}.pfx"
+                            CERT="vault-cert-${ROLE}"
+                            
+                            echo "Deleting certificate from Azure Key Vault: $CERT"
+
+                            # Check if certificate exists
+                            exists=\$(az keyvault certificate show --vault-name "${AZURE_KEYVAULT_NAME}" --name "$CERT" --query "name" -o tsv || echo "")
+                            if [ -z "\$exists" ]; then
+                                echo "Certificate does not exist: $CERT"
+                            else
+                                az keyvault certificate delete --vault-name "${AZURE_KEYVAULT_NAME}" --name "$CERT" --subscription "${AZURE_SUBSCRIPTION_ID}"
+                                echo "Certificate deleted: $CERT"
+                            fi
+                        '''
+                    }
+                }
+            }
+        }
+    }
+}

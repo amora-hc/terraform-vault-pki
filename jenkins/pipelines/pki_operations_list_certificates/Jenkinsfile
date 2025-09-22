@@ -1,0 +1,61 @@
+pipeline {
+    agent any
+    
+    environment {
+        WORK_DIR = '.'
+    }
+
+    parameters {
+        choice(name: 'PKI_MOUNT', choices: ['pki/subca-sand-azure'], description: 'Select PKI mount (leaf CA)')
+        string(name: 'VAULT_ADDR', defaultValue: 'https://vault-cluster.hashicorp.cloud:8200', description: 'Vault address')
+        string(name: 'AZURE_KEYVAULT_NAME', defaultValue: 'VaultKeyVault20250811', description: 'AKV name')
+    }
+
+    stages {
+        
+        stage('Checkout') {
+            steps {
+                git branch: 'main', url: 'https://github.com/amora-hc/terraform-vault-pki'
+            }
+        }
+        
+        stage('List Vault Certificates') {
+            steps {
+                script {
+                    def vaultAddr = params.VAULT_ADDR
+                    withCredentials([
+                        [
+                            $class: 'VaultTokenCredentialBinding',
+                            credentialsId: 'vault-cluster',
+                            vaultAddr: vaultAddr,
+                            vaultNamespace: 'admin/'
+                        ]
+                    ]) {
+                        sh '''
+                            VAULT_ADDR=$VAULT_ADDR \
+                            VAULT_TOKEN=$VAULT_TOKEN \
+                            VAULT_NAMESPACE=admin \
+                            bash jenkins/scripts/list_certs.sh
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('List Azure Key Vault certificates') {
+            steps {
+                script {
+                    def azureSP = params.azureSP
+                    withCredentials([azureServicePrincipal('azure-cloud')]) {
+                        sh '''
+                            echo "Listing Azure Key Vault certificates"
+
+                            az keyvault certificate list \
+                                --vault-name "${AZURE_KEYVAULT_NAME}" -o table
+                        '''
+                    }
+                }
+            }
+        }
+    }
+}

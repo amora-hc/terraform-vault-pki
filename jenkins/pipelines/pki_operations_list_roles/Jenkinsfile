@@ -1,0 +1,69 @@
+pipeline {
+    agent any
+
+    environment {
+        WORK_DIR = '.'
+    }
+
+    parameters {
+        string(name: 'VAULT_ADDR', defaultValue: 'https://vault-cluster.hashicorp.cloud:8200', description: 'Vault address')
+    }
+
+    stages {
+        stage('Vault PKI roles') {
+            steps {
+                script {
+                    def vaultAddr = params.VAULT_ADDR
+                    withCredentials([
+                        [
+                            $class: 'VaultTokenCredentialBinding',
+                            credentialsId: 'vault-cluster',
+                            vaultAddr: vaultAddr,
+                            vaultNamespace: 'admin/'
+                        ]
+                    ]) {
+                        sh '''
+                        set -e
+
+                        # Get all PKI leaf mounts
+                        pki_mounts=$(vault secrets list -format=json \
+                            | grep -B5 '"type": "pki"' \
+                            | grep '": {' \
+                            | awk -F'"' '{print $2}' \
+                            | grep -E 'pki/subca-.*-(azure|oci)/')
+
+                        if [ -z "$pki_mounts" ]; then
+                            echo "No PKI leaf mounts (subca-azure/oci) found."
+                            exit 0
+                        fi
+
+                        for mount in $pki_mounts; do
+                            # Get roles JSON, suppress errors
+                            roles_raw=$(vault list -format=json "${mount}roles" 2>/dev/null || echo "[]")
+
+                            # Remove empty lines and lines that are just { or [ or ]
+                            roles_list=$(echo "$roles_raw" | grep -v '^[{}\\[\\]]*$' | tr -d '"' | tr -d ' ' | tr ',' '\n')
+
+                            if [ -z "$roles_list" ]; then
+                                echo "========================================"
+                                echo "PKI leaf mount: $mount"
+                                echo "No roles found under $mount"
+                                continue
+                            fi
+
+                            echo "========================================"
+                            echo "PKI leaf mount: $mount"
+
+                            for role in $roles_list; do
+                                echo "----------------------------------------"
+                                echo "Role: $role"
+                                vault read "${mount}roles/$role" 2>/dev/null || echo "Failed to read role $role"
+                            done
+                        done
+                    '''
+                    }
+                }
+            }
+        }
+    }
+}

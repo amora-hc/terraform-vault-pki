@@ -1,0 +1,160 @@
+pipeline {
+    agent any
+    
+    environment {
+        WORK_DIR = '.'
+    }
+    
+    parameters {
+        string(name: 'CERT_PREFIX', defaultValue: 'example', description: 'Certificate prefix / common name first part')
+        choice(name: 'DNS_SUFFIX', choices: ['azure.sand.customer.internal'], description: 'DNS suffix for the certificate')
+        choice(name: 'PKI_MOUNT', choices: ['pki/subca-sand-azure/'], description: 'Select PKI mount (leaf CA)')
+        choice(name: 'ROLE', choices: ['subca-sand-azure-ssl-public', 'subca-sand-azure-sign-doc', 'subca-sand-oci-ssl-public'], description: 'Select role from chosen mount')
+        string(name: 'VAULT_ADDR', defaultValue: 'https://vault-cluster.hashicorp.cloud:8200', description: 'Vault address')
+        string(name: 'AZURE_KEYVAULT_NAME', defaultValue: 'VaultKeyVault20250811', description: 'AKV name')
+        string(name: 'AZURE_SUBSCRIPTION_ID', defaultValue: 'your-subscription-id', description: 'Azure cloud subscription ID')
+    }
+    
+    stages {
+        stage('Issue Certificate') {
+            steps {
+                script {
+                    def vaultAddr = params.VAULT_ADDR
+                    withCredentials([
+                        [
+                            $class: 'VaultTokenCredentialBinding',
+                            credentialsId: 'vault-cluster',
+                            vaultAddr: vaultAddr,
+                            vaultNamespace: 'admin/'
+                        ]
+                    ]) {
+                        sh '''
+                            set -e
+                            CN="${CERT_PREFIX}.${DNS_SUFFIX}"
+                            echo "Issuing certificate for CN: $CN"
+
+                            vault write -format=json "${PKI_MOUNT}issue/${ROLE}" common_name="$CN" ttl="24h" > cert_output.json
+
+                            CERT=$(jq -r '.data.certificate' cert_output.json)
+                            KEY=$(jq -r '.data.private_key' cert_output.json)
+                            CA=$(jq -r '.data.issuing_ca' cert_output.json)
+
+                            echo "$CERT" > "${CN}.crt"
+                            echo "$KEY" > "${CN}.key"
+                            echo "$CA" > "${CN}_ca.crt"
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('Transform Certificate') {
+            steps {
+                sh '''
+                    set -e
+                    CN="${CERT_PREFIX}.${DNS_SUFFIX}"
+                    PFX_FILE="${CN}.pfx"
+
+                    echo "Transforming certificate to PFX for Windows usage"
+
+                    # Combine certificate + private key + CA into PFX
+                    openssl pkcs12 -export \
+                        -out "$PFX_FILE" \
+                        -inkey "${CN}.key" \
+                        -in "${CN}.crt" \
+                        -certfile "${CN}_ca.crt" \
+                        -passout pass:${PFX_PASSWORD}
+
+                    echo "PFX certificate created: $PFX_FILE"
+                '''
+            }
+        }
+
+        stage('Store in Azure Key Vault') {
+            steps {
+                script {
+                    def azureSP = params.azureSP
+                    withCredentials([azureServicePrincipal('azure-cloud')]) {
+                        sh '''
+                            CN="${CERT_PREFIX}.${DNS_SUFFIX}"
+                            PFX_FILE="${CN}.pfx"
+                            CERT="vault-issued-cert-$(date +%Y%m%d%H%M)"
+                            
+                            echo "Uploading PFX to Azure Key Vault"
+
+                            az keyvault certificate import \
+                                --vault-name "${AZURE_KEYVAULT_NAME}" \
+                                --name "$CERT" \
+                                --file "$PFX_FILE" \
+                                --password "${PFX_PASSWORD}" \
+                                --subscription "${AZURE_SUBSCRIPTION_ID}"
+
+                            echo "Certificate uploaded to Azure Key Vault: $CN"
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('List Azure Key Vault certificates') {
+            steps {
+                script {
+                    def azureSP = params.azureSP
+                    withCredentials([azureServicePrincipal('azure-cloud')]) {
+                        sh ''' 
+                            echo "Listing Azure Key Vault certificates"
+
+                            az keyvault certificate list \
+                                --vault-name "${AZURE_KEYVAULT_NAME}" -o table
+                        '''
+                    }
+                }
+            }
+        }
+        stage('Verify Azure Key Vault Certificate') {
+            steps {
+                script {
+                    def azureSP = params.azureSP
+                    withCredentials([azureServicePrincipal('azure-cloud')]) {
+                        sh '''
+                            CN="${CERT_PREFIX}.${DNS_SUFFIX}"
+                            CERT="vault-issued-cert-$(date +%Y%m%d%H%M)"
+                            PEM_FILE="${CERT}.pem"
+                            KEY_FILE="${CERT}.key"
+                            PFX_FILE="${CN}.pfx"
+            
+                            echo "Fetching certificate ${CN} from Azure Key Vault"    
+                                
+                            az keyvault certificate download \
+                                --vault-name "${AZURE_KEYVAULT_NAME}" \
+                                --name "${CERT}" \
+                                --file "${PEM_FILE}" \
+                                --encoding PEM \
+                                --subscription "${AZURE_SUBSCRIPTION_ID}"
+                            
+                            az keyvault secret download \
+                                --vault-name "${AZURE_KEYVAULT_NAME}" \
+                                --name "${CERT}" \
+                                --file "${KEY_FILE}" \
+                                --encoding base64 \
+                                --subscription "${AZURE_SUBSCRIPTION_ID}"
+                            
+                            # Compare fingerprints
+                            echo "Original cert fingerprint:"
+                            openssl x509 -noout -fingerprint -sha256 -in "${CN}.crt"
+
+                            echo "Downloaded cert fingerprint:"
+                            openssl x509 -noout -fingerprint -sha256 -in ${PEM_FILE}
+
+                            # Do a diff if PEM directly compared is desired
+                            openssl x509 -in "${CN}.crt" -outform der | sha256sum > orig.fingerprint
+                            openssl x509 -in ${PEM_FILE} -outform der | sha256sum > akv.fingerprint
+
+                            diff orig.fingerprint akv.fingerprint && echo "Fingerprints match" || echo "Fingerprints differ"
+                        '''
+                    }
+                }
+            }
+        }
+    }
+}

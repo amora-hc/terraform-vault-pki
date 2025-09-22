@@ -1,0 +1,123 @@
+pipeline {
+    agent any
+    
+    environment {
+        WORK_DIR = '.'
+    }
+
+    parameters {
+        string(name: 'CERT_PREFIX', defaultValue: 'example', description: 'Certificate prefix / common name first part')
+        choice(name: 'DNS_SUFFIX', choices: ['azure.sand.customer.internal'], description: 'DNS suffix for the certificate')
+        choice(name: 'PKI_MOUNT', choices: ['pki/subca-sand-azure/'], description: 'Select PKI mount (leaf CA)')
+        choice(name: 'ROLE', choices: ['subca-sand-azure-ssl-public', 'subca-sand-azure-sign-doc', 'subca-sand-oci-ssl-public'], description: 'Select role from chosen mount')
+        string(name: 'VAULT_ADDR', defaultValue: 'https://vault-cluster.hashicorp.cloud:8200', description: 'Vault address')
+        string(name: 'AZURE_KEYVAULT_NAME', defaultValue: 'VaultKeyVault20250811', description: 'AKV name')
+        string(name: 'AZURE_SUBSCRIPTION_ID', defaultValue: 'your-subscription-id', description: 'Azure cloud subscription ID')
+    }
+    
+    stages {
+        stage('Generate Certificate') {
+            steps {
+                script {
+                    def vaultAddr = params.VAULT_ADDR
+                    withCredentials([
+                        [
+                            $class: 'VaultTokenCredentialBinding',
+                            credentialsId: 'vault-cluster',
+                            vaultAddr: vaultAddr,
+                            vaultNamespace: 'admin/'
+                        ]
+                    ]) {
+                        sh '''
+                            set -e
+
+                            # Build the full common name
+                            CN="${CERT_PREFIX}.${DNS_SUFFIX}"
+                            echo "Generating certificate for CN: $CN"
+                            echo "Using PKI mount: $PKI_MOUNT and role: $ROLE"
+        
+                            # Issue the certificate
+                            vault write -format=json "${PKI_MOUNT}issue/${ROLE}" common_name="$CN" ttl="24h" > cert_output.json
+        
+                            # Extract certificate, private key and CA
+                            CERT=$(jq -r '.data.certificate' cert_output.json)
+                            KEY=$(jq -r '.data.private_key' cert_output.json)
+                            CA=$(jq -r '.data.issuing_ca' cert_output.json)
+                            SERIAL=$(jq -r '.data.serial_number' cert_output.json)
+        
+                            # Save to workspace
+                            echo "$CERT" > "${CN}.crt"
+                            echo "$KEY" > "${CN}.key"
+                            echo "$CA" > "${CN}_ca.crt"
+
+                            # Extract and print expiration date from certificate
+                            EXPIRY_DATE=$(openssl x509 -enddate -noout -in "${CN}.crt" | cut -d'=' -f2)
+
+                            echo "Certificate, key and CA saved:"
+                            echo " - ${CN}.crt"
+                            echo " - ${CN}.key"
+                            echo " - ${CN}_ca.crt"
+                            echo "Serial number: $SERIAL"
+                            echo "Expiration date: $EXPIRY_DATE"
+        
+                            # Optional: inspect certificate details
+                            openssl x509 -in "${CN}.crt" -noout -text
+
+                            # Record serial number in a file for tracking
+                            echo "$SERIAL" >> /var/jenkins_home/cert_serials/available_serials.txt
+                            sort -u -o /var/jenkins_home/cert_serials/available_serials.txt /var/jenkins_home/cert_serials/available_serials.txt
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('Transform Certificate') {
+            steps {
+                sh '''
+                    set -e
+                    CN="${CERT_PREFIX}.${DNS_SUFFIX}"
+                    PFX_FILE="${CN}.pfx"
+
+                    echo "Transforming certificate to PFX for Windows usage"
+
+                    # Combine certificate + private key + CA into PFX
+                    openssl pkcs12 -export \
+                        -out "$PFX_FILE" \
+                        -inkey "${CN}.key" \
+                        -in "${CN}.crt" \
+                        -certfile "${CN}_ca.crt" \
+                        -passout pass:${PFX_PASSWORD}
+
+                    echo "PFX certificate created: $PFX_FILE"
+                '''
+            }
+        }
+
+        stage('Store in Azure Key Vault') {
+            steps {
+                script {
+                    def azureSP = params.azureSP
+                    withCredentials([azureServicePrincipal('azure-cloud')]) {
+                        sh '''
+                            CN="${CERT_PREFIX}.${DNS_SUFFIX}"
+                            PFX_FILE="${CN}.pfx"
+                            CERT="vault-cert-${ROLE}"
+
+                            echo "Uploading PFX to Azure Key Vault"
+
+                            az keyvault certificate import \
+                                --vault-name "${AZURE_KEYVAULT_NAME}" \
+                                --name "$CERT" \
+                                --file "$PFX_FILE" \
+                                --password "${PFX_PASSWORD}" \
+                                --subscription "${AZURE_SUBSCRIPTION_ID}"
+
+                            echo "Certificate uploaded to Azure Key Vault: $CN"
+                        '''
+                    }
+                }
+            }
+        }
+    }
+}

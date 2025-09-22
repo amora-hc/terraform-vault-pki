@@ -1,0 +1,91 @@
+pipeline {
+    agent any
+
+    environment {
+        WORK_DIR = '.'
+    }
+
+    parameters {
+        choice(name: 'ACTION', choices: ['plan', 'apply', 'destroy'], description: 'Choose Terraform action')
+        string(name: 'VAULT_ADDR', defaultValue: 'https://vault-cluster.hashicorp.cloud:8200', description: 'Vault address')
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                git branch: 'main', url: 'https://github.com/amora-hc/terraform-vault-pki/'
+            }
+        }
+
+        stage('Prereqs') {
+            steps {
+                sh 'terraform version'
+                sh 'vault version'
+                sh 'vault status' 
+            }
+        }    
+
+        stage('Terraform Init') {
+            steps {
+                dir("${WORK_DIR}") {
+                    sh 'terraform init'
+                    //sh 'cp $HOME/env/$WORK_DIR/terraform.tfvars .'
+                }
+            }
+        }
+        
+        stage('Terraform Validate') {
+            steps {
+                dir("${WORK_DIR}") {
+                    sh 'terraform validate'
+                }
+            }
+        }
+
+        stage('Terraform Plan') {
+            when {
+                expression { params.ACTION == 'plan' }
+            }
+            steps {
+                script {
+                def vaultAddr = params.VAULT_ADDR
+                    withCredentials([
+                        [
+                            $class: 'VaultTokenCredentialBinding',
+                            credentialsId: 'vault-cluster',
+                            vaultAddr: vaultAddr,
+                            vaultNamespace: 'admin/'
+                        ]
+                    ]){
+                        dir("${WORK_DIR}") {
+                            sh 'terraform plan'
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Terraform Apply') {
+            when {
+                expression { params.ACTION == 'apply' }
+            }
+            steps {
+                script {
+                def vaultAddr = params.VAULT_ADDR
+                    withCredentials([
+                        [
+                            $class: 'VaultTokenCredentialBinding',
+                            credentialsId: 'vault-cluster',
+                            vaultAddr: vaultAddr,
+                            vaultNamespace: 'admin/'
+                        ]
+                    ]){
+                        dir("${WORK_DIR}") {
+                            sh 'terraform apply --auto-approve'
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
