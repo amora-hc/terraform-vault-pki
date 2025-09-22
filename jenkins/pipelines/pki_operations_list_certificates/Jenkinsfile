@@ -1,0 +1,44 @@
+pipeline {
+    agent any
+    
+    environment {
+        WORK_DIR = '.'
+    }
+
+    parameters {
+        choice(name: 'PKI_MOUNT', choices: ['pki/subca-sand-azure'], description: 'Select PKI mount (leaf CA)')
+        string(name: 'VAULT_ADDR', defaultValue: 'https://vault-cluster.hashicorp.cloud:8200', description: 'Vault address')
+    }
+
+    stages {
+        
+        stage('Checkout') {
+            steps {
+                git branch: 'main', url: 'https://github.com/amora-hc/terraform-vault-pki'
+            }
+        }
+        
+        stage('List Certificates') {
+            steps {
+                script {
+                    def vaultAddr = params.VAULT_ADDR
+                    withCredentials([
+                        [
+                            $class: 'VaultTokenCredentialBinding',
+                            credentialsId: 'vault-cluster',
+                            vaultAddr: vaultAddr,
+                            vaultNamespace: 'admin/'
+                        ]
+                    ]) {
+                        sh '''
+                            VAULT_ADDR=$VAULT_ADDR \
+                            VAULT_TOKEN=$VAULT_TOKEN \
+                            VAULT_NAMESPACE=admin \
+                            bash jenkins/scripts/list_certs.sh
+                        '''
+                    }
+                }
+            }
+        }
+    }
+}

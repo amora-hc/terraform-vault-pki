@@ -1,0 +1,66 @@
+pipeline {
+    agent any
+    
+    environment {
+        WORK_DIR = '.'
+    }
+
+    parameters {
+        string(name: 'CERT_PREFIX', defaultValue: 'example', description: 'Certificate prefix / common name first part')
+        choice(name: 'DNS_SUFFIX', choices: ['azure.sand.customer.internal'], description: 'DNS suffix for the certificate')
+        choice(name: 'PKI_MOUNT', choices: ['pki/subca-sand-azure/'], description: 'Select PKI mount (leaf CA)')
+        choice(name: 'ROLE', choices: ['subca-sand-azure-ssl-public', 'subca-sand-azure-sign-doc', 'subca-sand-oci-ssl-public'], description: 'Select role from chosen mount')
+        string(name: 'VAULT_ADDR', defaultValue: 'https://vault-cluster.hashicorp.cloud:8200', description: 'Vault address')
+    }
+    
+    stages {
+        stage('Generate Certificate') {
+            steps {
+                script {
+                    def vaultAddr = params.VAULT_ADDR
+                    withCredentials([
+                        [
+                            $class: 'VaultTokenCredentialBinding',
+                            credentialsId: 'vault-cluster',
+                            vaultAddr: vaultAddr,
+                            vaultNamespace: 'admin/'
+                        ]
+                    ]) {
+                        sh '''
+                            set -e
+
+                            # Build the full common name
+                            CN="${CERT_PREFIX}.${DNS_SUFFIX}"
+        
+                            echo "Generating certificate for CN: $CN"
+                            echo "Using PKI mount: $PKI_MOUNT and role: $ROLE"
+        
+                            # Issue the certificate
+                            vault write -format=json "${PKI_MOUNT}issue/${ROLE}" common_name="$CN" ttl="24h" > cert_output.json
+        
+                            # Extract certificate, private key and CA
+                            CERT=$(jq -r '.data.certificate' cert_output.json)
+                            KEY=$(jq -r '.data.private_key' cert_output.json)
+                            CA=$(jq -r '.data.issuing_ca' cert_output.json)
+                            SERIAL=$(jq -r '.data.serial_number' cert_output.json)
+        
+                            # Save to workspace
+                            echo "$CERT" > "${CN}.crt"
+                            echo "$KEY" > "${CN}.key"
+                            echo "$CA" > "${CN}_ca.crt"
+        
+                            echo "Certificate, key and CA saved:"
+                            echo " - ${CN}.crt"
+                            echo " - ${CN}.key"
+                            echo " - ${CN}_ca.crt"
+                            echo "Serial number: $SERIAL"
+        
+                            # Optional: inspect certificate details
+                            openssl x509 -in "${CN}.crt" -noout -text
+                        '''
+                    }
+                }
+            }
+        }
+    }
+}
